@@ -9,3 +9,4 @@ state.db-*
 honcho.json
 *.sqlite
 *.sqlite3
+.DS_Store
