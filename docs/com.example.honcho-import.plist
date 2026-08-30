@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.honcho-import</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>exec "$HOME/honcho-import/scripts/scheduled-import.sh"</string>
+    </array>
+
+    <!-- Sundays at 10:00. launchd runs this on the next wake if the Mac was
+         asleep at the scheduled time, which is why this is a LaunchAgent and
+         not a crontab entry: cron would simply skip the missed week. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>0</integer>
+        <key>Hour</key><integer>10</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- The script writes its own timestamped log; these catch anything that
+         escapes it, such as an interpreter-level failure. -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR-USERNAME/Library/Logs/honcho-import/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR-USERNAME/Library/Logs/honcho-import/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

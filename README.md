@@ -136,6 +136,69 @@ python honcho_backfill.py \
 
 For an authenticated server, prefer `export HONCHO_API_KEY=...` over passing the key on the command line. Full options (profiles, `--mode`, observation settings) are in [`hermes-backfill/README.md`](hermes-backfill/README.md).
 
+## Running it on a schedule
+
+Because `--merge dedupe` makes an import idempotent, it is worth running
+periodically rather than once. Claude Code prunes its own transcripts on a
+retention window (~30 days by default), so history that is never imported is
+eventually gone for good.
+
+`scripts/scheduled-import.sh` runs both Claude importers and is built for
+unattended use: it gates on being on the right network, exits `0` and quietly
+when it is not, logs each run, and prunes old logs. Configure it with
+`~/.honcho/import-schedule.env` — keep personal values there, not in the repo:
+
+```bash
+HONCHO_IMPORT_REPO="$HOME/honcho-import"
+HONCHO_IMPORT_PYTHON="$HOME/honcho-import/.venv/bin/python"
+HONCHO_IMPORT_SSID_GLOB='my_network*'          # optional
+HONCHO_IMPORT_GATEWAY_MACS="aa:bb:cc:dd:ee:ff" # optional; see below
+HONCHO_IMPORT_REQUIRE_HONCHO=1
+HONCHO_IMPORT_URL="http://your-honcho-host:18100"
+```
+
+Anything already in the environment overrides the file, so a one-off run can
+be steered without editing config:
+
+```bash
+HONCHO_IMPORT_GATEWAY_MACS="" ./scripts/scheduled-import.sh
+```
+
+### Gating on the network
+
+A self-hosted Honcho usually lives on one LAN, and running the import from
+elsewhere just fills a log with connection errors. Two gates are available and
+can be combined:
+
+- **`HONCHO_IMPORT_SSID_GLOB`** — matched against the current Wi-Fi SSID.
+- **`HONCHO_IMPORT_GATEWAY_MACS`** — an allowlist of default-gateway MAC
+  addresses, used automatically whenever the SSID cannot be read.
+
+The fallback exists because **macOS 15+ will not tell a background job the
+SSID.** Reading it requires Location Services authorization, which a LaunchAgent
+or cron job has no way to obtain; every unprivileged method (`ipconfig
+getsummary`, `networksetup`, `system_profiler`) returns the literal string
+`<redacted>`, and the old `airport` binary is gone. The gateway MAC is a stable
+fingerprint for the same router and needs no permissions. Set both: the SSID
+rule takes over on its own if the job is ever granted location access.
+
+### Scheduling on macOS
+
+Prefer a **LaunchAgent** over a crontab entry. `StartCalendarInterval` fires on
+the next wake if the Mac was asleep at the scheduled time; cron simply skips
+the run, which for a weekly job on a laptop usually means it never happens.
+
+```bash
+cp docs/com.example.honcho-import.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.honcho-import.plist
+
+launchctl kickstart -p gui/$(id -u)/com.example.honcho-import  # run it now
+launchctl print gui/$(id -u)/com.example.honcho-import | grep "last exit"
+```
+
+Logs land in `~/Library/Logs/honcho-import/`, newest last, capped at
+`HONCHO_IMPORT_LOG_KEEP` files (default 12).
+
 ## Safety
 
 - **Dry-run by default** — every importer previews unless `--execute` is supplied. A dry run reads the target workspace (the SDK's get-or-create workspace call is the only write it makes) so the preview is the real delta; `--offline` skips even that.
@@ -150,6 +213,8 @@ honcho-import/
 ├── README.md              # this overview
 ├── requirements.txt       # honcho-ai floor (Honcho 3.x <- honcho-ai 2.x)
 ├── LICENSE                # applies repo-wide
+├── docs/                  # sample LaunchAgent
+├── scripts/               # scheduled-import.sh (unattended re-runs)
 ├── claude-code-backfill/  # Claude Code importer + README
 ├── cowork-backfill/       # Claude Cowork importer + README
 └── hermes-backfill/       # Hermes Agent importer + README
