@@ -32,7 +32,13 @@ closely as possible.
     (matching the plugin's chunkContent()).
   - original transcript timestamps preserved as Honcho created_at for every
     message type (user, assistant, and tool summaries).
-  - dry-run unless --execute is passed.
+  - dry-run unless --execute is passed. A dry run still *reads* the target
+    workspace (unless --offline) so the preview reflects what is genuinely
+    missing, not just what the transcripts contain.
+
+Targets Honcho server 3.x (the /v3 API) via the honcho-ai Python SDK 2.4+.
+Those version numbers do not line up on purpose: it is the honcho-ai 2.x line
+that speaks /v3, not a 3.x SDK. See requirements.txt.
 
 The goal is fidelity: the result should look like what Honcho would contain if
 the plugin had been installed from day one with default settings. Defaults
@@ -43,6 +49,8 @@ let you trim noise (--no-tool-summaries, --no-brief) or go beyond native
 Deliberate divergences from the live write path (documented, not bugs):
   - each turn is written once (the live plugin's Stop hook + SessionEnd flush
     re-save the same assistant text; a backfill must not duplicate).
+  - re-running is safe: the default --merge dedupe mode indexes what the
+    session already holds and writes only the messages missing from it.
   - no per-flush 40-message cap (a backfill keeps the full history).
   - no operational "[Session ended]" markers or "[Git External]" observations
     (the latter cannot be reconstructed from transcripts).
@@ -55,11 +63,15 @@ options.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -764,13 +776,17 @@ def build_honcho_messages(
     redact: bool,
     session_name: str,
 ):
-    """Build SDK message objects mirroring the live plugin's metadata shape."""
+    """Build SDK message objects mirroring the live plugin's metadata shape.
+
+    Returns (batch, kinds) where kinds[i] is the ("user"|"assistant"|"tool",
+    source message index) of batch[i]. Carrying the kind per chunk lets the
+    caller re-tally counts after dedupe has removed some of them.
+    """
     batch = []
-    user_count = 0
-    asst_count = 0
-    tool_count = 0
-    for msg in group.messages:
+    kinds: list[tuple[str, int]] = []
+    for msg_index, msg in enumerate(group.messages):
         peer = user_peer if msg.role == "user" else ai_peer
+        kind = "tool" if msg.is_tool else msg.role
         content = redact_secrets(msg.content) if redact else msg.content
         for chunk_index, chunk in enumerate(chunk_content(content)):
             metadata: dict[str, Any] = {
@@ -788,13 +804,8 @@ def build_honcho_messages(
             if created_at is not None:
                 kwargs["created_at"] = created_at
             batch.append(peer.message(chunk, **kwargs))
-        if msg.is_tool:
-            tool_count += 1
-        elif msg.role == "user":
-            user_count += 1
-        else:
-            asst_count += 1
-    return batch, user_count, asst_count, tool_count
+            kinds.append((kind, msg_index))
+    return batch, kinds
 
 
 # ---------------------------------------------------------------------------
@@ -815,27 +826,206 @@ def init_honcho(cfg: CCImportConfig, workspace: str):
     return Honcho(**kwargs)
 
 
-def _safe_existing_messages(session) -> list:
-    """Return existing messages, treating a not-yet-created session as empty.
+# ---------------------------------------------------------------------------
+# Server compatibility (Honcho 3.x / honcho-ai 2.4+)
+# ---------------------------------------------------------------------------
 
-    The SDK raises NotFoundError when .messages() is called on a session that
-    has never been written to. For our existence check that simply means "no
-    messages yet", so we swallow it rather than aborting the import.
+# Limits declared by the Honcho 3.x OpenAPI schema. MessageCreate.content caps
+# at 25,000 characters and MessageBatchCreate accepts at most 100 messages, so
+# a chunk plus its "[Part i/n] " prefix must stay under the former and
+# --batch-size under the latter.
+SERVER_MAX_CONTENT = 25_000
+SERVER_MAX_BATCH = 100
+# Page size for reading a session back. Not a server limit, just the size that
+# keeps the round trips down when indexing a few thousand existing messages.
+EXISTING_PAGE_SIZE = 100
+
+
+def read_server_version(base_url: str | None, timeout: float) -> str | None:
+    """Best-effort read of the server's version from its OpenAPI document.
+
+    Purely informational: a server that requires auth on /openapi.json, or an
+    older build without one, simply yields None and the import proceeds.
+    """
+    if not base_url:
+        return None
+    url = base_url.rstrip("/") + "/openapi.json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return json.load(resp).get("info", {}).get("version")
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def sdk_versions() -> tuple[str, str | None]:
+    """Return (API version the SDK speaks, installed honcho-ai version)."""
+    try:
+        from honcho.http import routes
+
+        api_version = str(getattr(routes, "API_VERSION", "unknown"))
+    except ImportError:
+        api_version = "unknown"
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            pkg_version = version("honcho-ai")
+        except PackageNotFoundError:
+            pkg_version = None
+    except ImportError:
+        pkg_version = None
+    return api_version, pkg_version
+
+
+def print_version_banner(base_url: str | None, timeout: float) -> None:
+    """Print server/SDK versions and warn when they cannot speak to each other.
+
+    The version numbers are deliberately confusing: the Honcho *server* is on
+    3.x and serves /v3, while the Python SDK that speaks /v3 is honcho-ai 2.4+.
+    Printing both removes the guesswork.
+    """
+    api_version, pkg_version = sdk_versions()
+    server = read_server_version(base_url, timeout)
+    sdk_label = f"honcho-ai {pkg_version}" if pkg_version else "honcho-ai (version unknown)"
+    print(f"Server version: {server or '<unknown>'}   SDK: {sdk_label} (speaks API {api_version})")
+    if server and api_version != "unknown":
+        server_major = server.split(".", 1)[0]
+        if api_version != f"v{server_major}":
+            print(
+                f"WARNING: SDK speaks API {api_version} but the server reports {server}. "
+                f"Install an SDK that targets /v{server_major} (Honcho 3.x needs honcho-ai>=2.4).",
+                file=sys.stderr,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Merge modes: what to do when the target session already holds messages
+# ---------------------------------------------------------------------------
+
+MERGE_MODES = ("dedupe", "skip", "gap", "force")
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    return type(exc).__name__ == "NotFoundError" or "not found" in str(exc).lower()
+
+
+def fetch_existing_messages(session) -> list:
+    """Every message already in a session, or [] if it has not been created yet.
+
+    Iterating a SyncPage transparently walks every page, so the page size is
+    what decides how many round trips this costs.
     """
     try:
-        return list(session.messages())
+        return list(session.messages(size=EXISTING_PAGE_SIZE))
     except Exception as exc:  # noqa: BLE001
-        if type(exc).__name__ == "NotFoundError" or "not found" in str(exc).lower():
+        if _is_not_found(exc):
             return []
         raise
 
 
-def _earliest_existing_created_at(session) -> datetime | None:
-    earliest: datetime | None = None
-    for m in _safe_existing_messages(session):
-        created = getattr(m, "created_at", None)
-        if created is None:
+def fingerprint(peer_id: str, content: str) -> str:
+    """Identity of a message for dedupe: author plus whitespace-normalized text.
+
+    Normalizing whitespace lets a turn written live by the plugin match the
+    same turn reconstructed from the transcript when only trailing newlines or
+    wrapping differ.
+    """
+    normalized = " ".join(str(content).split())
+    return hashlib.sha1(f"{peer_id}\x00{normalized}".encode()).hexdigest()  # noqa: S324
+
+
+# A duplicate is the *same text at about the same time*. Text alone is not
+# enough: a one-line tool summary like "[Tool] Bash: npm test" recurs verbatim
+# across months, and matching on content alone would let a May message suppress
+# an identical August one. Imported messages carry the transcript's own
+# timestamp and the live plugin writes within seconds of the turn, so an hour
+# of slack separates "the same message" from "the same words again later".
+DEFAULT_DEDUPE_WINDOW = 3600
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        value = created_at_from_iso(value)
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def build_existing_index(existing: Sequence[Any]) -> dict[str, list[datetime | None]]:
+    """Map each fingerprint already in the session to its creation times."""
+    index: dict[str, list[datetime | None]] = {}
+    for m in existing:
+        fp = fingerprint(getattr(m, "peer_id", ""), getattr(m, "content", ""))
+        index.setdefault(fp, []).append(_as_utc(getattr(m, "created_at", None)))
+    for times in index.values():
+        times.sort(key=lambda d: (d is None, d or datetime.min.replace(tzinfo=timezone.utc)))
+    return index
+
+
+def _consume_match(times: list, incoming: datetime | None, tolerance: timedelta | None) -> bool:
+    """Consume the closest existing timestamp within tolerance; True if matched.
+
+    Consuming rather than merely testing keeps this a multiset check: a turn
+    that genuinely occurs twice is only suppressed twice.
+    """
+    if not times:
+        return False
+    if tolerance is None or incoming is None:
+        times.pop(0)
+        return True
+    best_index: int | None = None
+    best_delta: timedelta | None = None
+    for i, existing_at in enumerate(times):
+        if existing_at is None:
             continue
+        delta = abs(existing_at - incoming)
+        if delta <= tolerance and (best_delta is None or delta < best_delta):
+            best_index, best_delta = i, delta
+    if best_index is None:
+        return False
+    times.pop(best_index)
+    return True
+
+
+def drop_already_present(
+    batch: list,
+    kinds: list,
+    existing_index: dict[str, list[datetime | None]],
+    window_seconds: int = DEFAULT_DEDUPE_WINDOW,
+) -> tuple[list, list, int]:
+    """Filter a built batch down to what the session does not already hold.
+
+    A negative window_seconds drops the timestamp check and matches on text
+    alone; zero demands the timestamps agree exactly.
+    """
+    remaining = {fp: list(times) for fp, times in existing_index.items()}
+    tolerance = None if window_seconds < 0 else timedelta(seconds=window_seconds)
+    kept_batch: list = []
+    kept_kinds: list = []
+    dropped = 0
+    for params, kind in zip(batch, kinds):
+        fp = fingerprint(getattr(params, "peer_id", ""), getattr(params, "content", ""))
+        incoming = _as_utc(getattr(params, "created_at", None))
+        if _consume_match(remaining.get(fp, []), incoming, tolerance):
+            dropped += 1
+            continue
+        kept_batch.append(params)
+        kept_kinds.append(kind)
+    return kept_batch, kept_kinds, dropped
+
+
+def tally_kinds(kinds: Sequence[tuple[str, int]]) -> tuple[int, int, int]:
+    """Count distinct source messages per kind among a list of surviving chunks."""
+    seen: dict[str, set[int]] = {"user": set(), "assistant": set(), "tool": set()}
+    for kind, msg_index in kinds:
+        seen[kind].add(msg_index)
+    return len(seen["user"]), len(seen["assistant"]), len(seen["tool"])
+
+
+def earliest_created_at(existing: Sequence[Any]) -> datetime | None:
+    earliest: datetime | None = None
+    for m in existing:
+        created = getattr(m, "created_at", None)
         if isinstance(created, str):
             created = created_at_from_iso(created)
         if created is None:
@@ -843,6 +1033,32 @@ def _earliest_existing_created_at(session) -> datetime | None:
         if earliest is None or created < earliest:
             earliest = created
     return earliest
+
+
+class PreviewPeer:
+    """Stand-in for an SDK Peer so a dry run can build the real batch offline.
+
+    Produces objects with the same .peer_id / .content surface the dedupe and
+    reporting code reads, without the get-or-create call a real client.peer()
+    would make.
+    """
+
+    __slots__ = ("id",)
+
+    def __init__(self, peer_id: str) -> None:
+        self.id = peer_id
+
+    def message(self, content: str, **kwargs: Any) -> "PreviewMessage":
+        return PreviewMessage(self.id, content, kwargs.get("created_at"))
+
+
+class PreviewMessage:
+    __slots__ = ("peer_id", "content", "created_at")
+
+    def __init__(self, peer_id: str, content: str, created_at: datetime | None) -> None:
+        self.peer_id = peer_id
+        self.content = content
+        self.created_at = created_at
 
 
 # ---------------------------------------------------------------------------
@@ -885,8 +1101,23 @@ def main() -> int:
     parser.add_argument("--redact-secrets", action="store_true", help="Redact secrets before import: prefixed tokens (ghp_/sk-/nvapi-) AND labeled secrets near cues like 'session key', 'api key', 'password', 'token'")
 
     # Idempotency / merge behavior
-    parser.add_argument("--force-reimport", action="store_true", help="Append even if the target session already has messages (may duplicate)")
-    parser.add_argument("--fill-gap", action="store_true", help="Only import messages older than the earliest existing message in the session (safe merge with live data)")
+    parser.add_argument(
+        "--merge",
+        choices=MERGE_MODES,
+        default="dedupe",
+        help=(
+            "What to do when the target session already holds messages. "
+            "dedupe: write only the messages it does not already have (default). "
+            "skip: leave the whole session alone. "
+            "gap: write only messages older than its earliest existing message. "
+            "force: append everything (may duplicate)"
+        ),
+    )
+    parser.add_argument("--dedupe-window", type=int, default=DEFAULT_DEDUPE_WINDOW, help="Seconds of clock slack allowed when matching an incoming message against an existing one (--merge dedupe). 0 = timestamps must match exactly, -1 = match on text alone")
+    parser.add_argument("--offline", action="store_true", help="Dry-run without contacting Honcho: previews the transcripts only, with no idea what is already imported")
+    # Retained aliases for the pre-merge-mode flags.
+    parser.add_argument("--force-reimport", action="store_true", help="Alias for --merge force")
+    parser.add_argument("--fill-gap", action="store_true", help="Alias for --merge gap")
 
     # Run control
     parser.add_argument("--execute", action="store_true", help="Actually write to Honcho (otherwise dry-run)")
@@ -937,9 +1168,24 @@ def main() -> int:
     brief_enabled = not args.no_brief
     tool_summaries_enabled = not args.no_tool_summaries
 
+    # The old boolean flags still work; they simply select a merge mode.
+    if args.force_reimport and args.fill_gap:
+        print("ERROR: --force-reimport and --fill-gap are mutually exclusive.", file=sys.stderr)
+        return 1
+    if args.force_reimport:
+        args.merge = "force"
+    elif args.fill_gap:
+        args.merge = "gap"
+    if args.offline and args.execute:
+        print("ERROR: --offline is a dry-run flag. Writing without reading the workspace first would duplicate messages.", file=sys.stderr)
+        return 1
+
     if args.batch_size < 1:
         print("ERROR: --batch-size must be >= 1.", file=sys.stderr)
         return 1
+    if args.batch_size > SERVER_MAX_BATCH:
+        print(f"NOTE: --batch-size {args.batch_size} exceeds the server maximum of {SERVER_MAX_BATCH}; clamping.")
+        args.batch_size = SERVER_MAX_BATCH
     if args.batch_delay < 0:
         print("ERROR: --batch-delay must be >= 0.", file=sys.stderr)
         return 1
@@ -961,8 +1207,11 @@ def main() -> int:
     print(f"Observation mode: {cfg.observation_mode}")
     print(f"Content (native default): tool-summaries={tool_summaries_enabled} brief={brief_enabled} | thinking={args.include_thinking} tools-annotate={args.include_tools} commands={args.include_commands} subagents={args.include_subagents}")
     print(f"Redact secrets: {args.redact_secrets}")
-    merge_mode = "force-append" if args.force_reimport else ("fill-gap" if args.fill_gap else "skip-if-exists")
-    print(f"Existing-session policy: {merge_mode}")
+    policy = f"--merge {args.merge}"
+    if args.merge == "dedupe":
+        window = "text only" if args.dedupe_window < 0 else f"{args.dedupe_window}s clock slack"
+        policy += f" ({window})"
+    print(f"Existing-session policy: {policy}")
     print(f"Mode: {'EXECUTE' if args.execute else 'DRY RUN'}")
 
     files = iter_transcript_files(projects_dir, include_subagents=args.include_subagents)
@@ -1011,107 +1260,141 @@ def main() -> int:
                 print(f"  - {name}")
             print("  Use --include-subagents to import subagent sidechains (attribution to your peers is approximate).")
 
+    # A dry run reads the workspace so the preview reports what is actually
+    # missing rather than what the transcripts happen to contain. --merge force
+    # needs no reads, and --offline opts out of contacting the server at all.
+    inspect_existing = args.merge != "force" and not args.offline
+    need_client = args.execute or (inspect_existing and bool(cfg.api_key))
+
     client = None
     user_peer = ai_peer = None
-    SessionPeerConfig = None
-    if args.execute:
+    Session = SessionPeerConfig = None
+    if need_client:
         print("\nPreparing Honcho client...")
+        print_version_banner(cfg.base_url, cfg.timeout)
         client = init_honcho(cfg, cfg.workspace)
-        user_peer = client.peer(cfg.peer_name)
-        ai_peer = client.peer(cfg.ai_peer)
-        # NOTE: client.session(id) is a get-or-create POST that 404s on this
-        # self-hosted server when the session ALREADY exists (it only works for
-        # new sessions). Constructing Session(id, client) directly makes no API
-        # call, and add_messages()/add_peers()/messages() all work against both
-        # new and existing sessions — so we use that instead.
+        # Session(id, client) and Peer(id, client) are local constructions: no
+        # API call until something is read or written through them, which keeps
+        # a dry run read-only.
         from honcho.session import Session, SessionPeerConfig  # noqa: F401
-        print(f"Honcho client ready for workspace '{cfg.workspace}' (connects on first write)")
+
+        # One cheap call up front so an unreachable host or a bad key fails
+        # here with a clear message, instead of once per session further down.
+        # It also performs the SDK's get-or-create workspace POST, which is the
+        # only write a dry run makes.
+        try:
+            client.get_metadata()
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: cannot reach Honcho workspace '{cfg.workspace}' at {cfg.base_url or '<SDK default>'}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
+        if args.execute:
+            user_peer = client.peer(cfg.peer_name)
+            ai_peer = client.peer(cfg.ai_peer)
+            print(f"Honcho client ready for workspace '{cfg.workspace}'")
+        else:
+            print(f"Honcho client ready for workspace '{cfg.workspace}' (read-only: dry run)")
+    elif inspect_existing:
+        print("\nNOTE: no API key resolved, so this dry run cannot check what is already imported.")
+        inspect_existing = False
+
+    # In a dry run nothing is written, so the batch is built against local
+    # stand-ins rather than real peers.
+    if user_peer is None:
+        user_peer = PreviewPeer(cfg.peer_name)
+        ai_peer = PreviewPeer(cfg.ai_peer)
 
     processed = 0
     total_user = 0
     total_assistant = 0
     total_tool = 0
     total_written = 0
+    total_deduped = 0
     skipped = 0
     errors = 0
     start = time.time()
 
     for i, group in enumerate(groups, start=1):
-        # In dry-run, peers are not instantiated; build a lightweight preview.
-        if not args.execute:
-            n_user = sum(1 for m in group.messages if m.role == "user")
-            n_tool = sum(1 for m in group.messages if m.is_tool)
-            n_asst = len(group.messages) - n_user - n_tool
-            chunks = sum(len(chunk_content(m.content)) for m in group.messages)
-            total_user += n_user
-            total_assistant += n_asst
-            total_tool += n_tool
-            total_written += chunks
-            processed += 1
-            label = f" {group.session_name}" if args.verbose else ""
-            print(f"  [{i}/{len(groups)}]{label}  files={len(group.files)} user={n_user} assistant={n_asst} tool={n_tool} -> {chunks} chunks  ({group.cwd})")
-            continue
-
         try:
-            session = Session(group.session_name, client)
+            session = Session(group.session_name, client) if client is not None else None
 
-            existing_earliest = None
-            if not args.force_reimport:
-                existing = _safe_existing_messages(session)
-                if existing:
-                    if args.fill_gap:
-                        existing_earliest = _earliest_existing_created_at(session)
-                    else:
-                        skipped += 1
-                        note = f"  SKIP (session already has {len(existing)} messages)"
-                        if args.verbose:
-                            note += f": {group.session_name}"
-                        print(note)
-                        continue
+            existing: list = []
+            if session is not None and inspect_existing:
+                existing = fetch_existing_messages(session)
 
-            # Optionally restrict to messages older than existing data (gap fill).
+            # --merge skip / gap decide up front, on the session as a whole.
+            if existing and args.merge == "skip":
+                skipped += 1
+                note = f"  SKIP (session already has {len(existing)} messages)"
+                if args.verbose:
+                    note += f": {group.session_name}"
+                print(note)
+                continue
+
             messages_to_use = group.messages
-            if existing_earliest is not None:
-                messages_to_use = [
-                    m for m in group.messages
-                    if (created_at_from_iso(m.timestamp) or datetime.max.replace(tzinfo=timezone.utc)) < existing_earliest
-                ]
+            if existing and args.merge == "gap":
+                cutoff = earliest_created_at(existing)
+                if cutoff is not None:
+                    messages_to_use = [
+                        m for m in group.messages
+                        if (created_at_from_iso(m.timestamp) or datetime.max.replace(tzinfo=timezone.utc)) < cutoff
+                    ]
                 if not messages_to_use:
                     skipped += 1
                     print(f"  SKIP (no messages older than existing data){': ' + group.session_name if args.verbose else ''}")
                     continue
 
             preview_group = TranscriptGroup(group.session_name, group.cwd, group.git_branch, group.files, messages_to_use)
-            batch, n_user, n_asst, n_tool = build_honcho_messages(
+            batch, kinds = build_honcho_messages(
                 preview_group,
                 user_peer=user_peer,
                 ai_peer=ai_peer,
                 redact=args.redact_secrets,
                 session_name=group.session_name,
             )
+
+            # --merge dedupe decides per message, against what is already there.
+            deduped = 0
+            if existing and args.merge == "dedupe":
+                batch, kinds, deduped = drop_already_present(
+                    batch, kinds, build_existing_index(existing), args.dedupe_window
+                )
+                total_deduped += deduped
+
             if not batch:
                 skipped += 1
+                reason = "already fully imported" if deduped else "nothing to import"
+                print(f"  SKIP ({reason}){': ' + group.session_name if args.verbose else ''}")
                 continue
 
-            # Add peers exactly as the live plugin does for the observation mode.
-            if cfg.observation_mode == "directional":
-                session.add_peers([user_peer, (ai_peer, SessionPeerConfig(observe_others=True))])
-            else:
-                session.add_peers([user_peer, ai_peer])
+            n_user, n_asst, n_tool = tally_kinds(kinds)
 
-            for j in range(0, len(batch), args.batch_size):
-                session.add_messages(batch[j : j + args.batch_size])
+            if args.execute:
+                # Add peers exactly as the live plugin does for the observation mode.
+                if cfg.observation_mode == "directional":
+                    session.add_peers([user_peer, (ai_peer, SessionPeerConfig(observe_others=True))])
+                else:
+                    session.add_peers([user_peer, ai_peer])
+
+                for j in range(0, len(batch), args.batch_size):
+                    session.add_messages(batch[j : j + args.batch_size])
 
             processed += 1
             total_user += n_user
             total_assistant += n_asst
             total_tool += n_tool
             total_written += len(batch)
-            if args.verbose or i == 1 or i % 20 == 0:
-                rate = (i / (time.time() - start) * 60) if time.time() > start else 0
-                print(f"  [{i}/{len(groups)}] {group.session_name}  user={n_user} assistant={n_asst} tool={n_tool} -> {len(batch)} chunks  ({rate:.0f} sess/min)")
 
-            if args.batch_delay:
+            have = f" have={len(existing)}" if existing else ""
+            dedupe_note = f" deduped={deduped}" if deduped else ""
+            if not args.execute:
+                label = f" {group.session_name}" if args.verbose else ""
+                print(f"  [{i}/{len(groups)}]{label}  files={len(group.files)}{have}{dedupe_note} user={n_user} assistant={n_asst} tool={n_tool} -> {len(batch)} new chunks  ({group.cwd})")
+            elif args.verbose or i == 1 or i % 20 == 0:
+                rate = (i / (time.time() - start) * 60) if time.time() > start else 0
+                print(f"  [{i}/{len(groups)}] {group.session_name}{have}{dedupe_note}  user={n_user} assistant={n_asst} tool={n_tool} -> {len(batch)} chunks  ({rate:.0f} sess/min)")
+
+            if args.execute and args.batch_delay:
                 time.sleep(args.batch_delay)
         except Exception as exc:  # noqa: BLE001 - keep importing other sessions
             errors += 1
@@ -1128,14 +1411,18 @@ def main() -> int:
     print(f"  Assistant messages: {total_assistant:,}")
     print(f"  Tool summaries: {total_tool:,}")
     print(f"  Honcho messages/chunks: {total_written:,}")
-    print(f"  Skipped: {skipped:,}")
+    print(f"  Already present (deduped): {total_deduped:,}")
+    print(f"  Sessions skipped: {skipped:,}")
     print(f"  Errors: {errors:,}")
     print(f"  Workspace: {cfg.workspace}")
     if not args.execute:
-        print("\nDry-run only. Re-run with --execute to write to Honcho.")
-        print("Tip: per-directory sessions merge with your LIVE history. If a target session")
-        print("     already has live messages, use --fill-gap (backfill the older gap) or")
-        print("     --force-reimport (append) deliberately.")
+        if inspect_existing and not errors:
+            print("\nDry-run only. Counts above are the DELTA against what the workspace already holds.")
+        elif inspect_existing:
+            print("\nDry-run only. Some sessions could not be read, so the counts above are NOT a reliable delta.")
+        else:
+            print("\nDry-run only. The workspace was not read, so counts are the full transcript, not the delta.")
+        print("Re-run with --execute to write to Honcho.")
     print("=" * 72)
     return 0 if errors == 0 else 2
 

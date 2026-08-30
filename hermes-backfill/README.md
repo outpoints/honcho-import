@@ -37,20 +37,28 @@ Those behaviors are either explicit flags or out of scope.
 
 - Python 3.10+
 - A Hermes Agent `state.db` file
-- The `honcho-ai` Python package
+- `honcho-ai` 2.4+ — the SDK line that speaks Honcho 3.x's `/v3` API
 - A reachable Honcho server
 
 Install the SDK if needed:
 
 ```bash
-python -m pip install honcho-ai
+python -m pip install -r ../requirements.txt
 ```
 
 Or with `uv`:
 
 ```bash
-uv pip install honcho-ai
+uv pip install -r ../requirements.txt
 ```
+
+The server and SDK version numbers do not line up: **Honcho server 3.x is
+driven by honcho-ai 2.x.** The importer prints both on startup and warns if the
+SDK is speaking a different API version than the server serves.
+
+Unlike the Claude Code and Cowork importers, this one has no `--merge dedupe`
+mode: it still skips any target session that already holds messages unless
+`--force-reimport` is passed.
 
 If you already run Hermes Agent, the SDK is often available in Hermes' virtual environment. In that case you can run the script with that Python interpreter instead of installing anything globally.
 
@@ -449,8 +457,14 @@ print(s.queue_status())
 Install the Honcho SDK in the environment you are using:
 
 ```bash
-python -m pip install honcho-ai
+python -m pip install -r ../requirements.txt
 ```
+
+### `404 Not Found` on every write
+
+The installed SDK is speaking the wrong API version. Honcho server 3.x serves
+`/v3`, which the honcho-ai **2.x** line speaks; honcho-ai 1.x does not. The
+startup banner prints both versions — check it before digging further.
 
 ### `State DB not found`
 

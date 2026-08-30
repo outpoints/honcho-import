@@ -15,6 +15,10 @@ as closely as possible while remaining safe to run from a dry-run first:
   - do not upload transcript files, attach metadata, or redact content unless explicitly requested
   - dry-run unless --execute is passed
 
+Targets Honcho server 3.x (the /v3 API) via the honcho-ai Python SDK 2.4+.
+Those version numbers do not line up on purpose: it is the honcho-ai 2.x line
+that speaks /v3, not a 3.x SDK. See requirements.txt.
+
 No user-specific hosts, peer names, workspace names, session IDs, API URLs, or
 credentials are hardcoded in this script. Use --help for configuration options.
 """
@@ -29,15 +33,79 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+
+def read_server_version(base_url: str | None, timeout: float) -> str | None:
+    """Best-effort read of the server's version from its OpenAPI document.
+
+    Purely informational: a server that requires auth on /openapi.json, or an
+    older build without one, simply yields None and the import proceeds.
+    """
+    if not base_url:
+        return None
+    url = base_url.rstrip("/") + "/openapi.json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return json.load(resp).get("info", {}).get("version")
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def sdk_versions() -> tuple[str, str | None]:
+    """Return (API version the SDK speaks, installed honcho-ai version)."""
+    try:
+        from honcho.http import routes
+
+        api_version = str(getattr(routes, "API_VERSION", "unknown"))
+    except ImportError:
+        api_version = "unknown"
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            pkg_version = version("honcho-ai")
+        except PackageNotFoundError:
+            pkg_version = None
+    except ImportError:
+        pkg_version = None
+    return api_version, pkg_version
+
+
+def print_version_banner(base_url: str | None, timeout: float) -> None:
+    """Print server/SDK versions and warn when they cannot speak to each other.
+
+    The version numbers are deliberately confusing: the Honcho *server* is on
+    3.x and serves /v3, while the Python SDK that speaks /v3 is honcho-ai 2.4+.
+    Printing both removes the guesswork.
+    """
+    api_version, pkg_version = sdk_versions()
+    server = read_server_version(base_url, timeout)
+    sdk_label = f"honcho-ai {pkg_version}" if pkg_version else "honcho-ai (version unknown)"
+    print(f"Server version: {server or '<unknown>'}   SDK: {sdk_label} (speaks API {api_version})")
+    if server and api_version != "unknown":
+        server_major = server.split(".", 1)[0]
+        if api_version != f"v{server_major}":
+            print(
+                f"WARNING: SDK speaks API {api_version} but the server reports {server}. "
+                f"Install an SDK that targets /v{server_major} (Honcho 3.x needs honcho-ai>=2.4).",
+                file=sys.stderr,
+            )
+
+
 HERMES_HOME_DEFAULT = Path.home() / ".hermes"
 HERMES_AGENT_DIR = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_SOURCES = "cli,telegram,webui,tui,api_server"
-DEFAULT_MESSAGE_MAX_CHARS = 25_000
+# Limits declared by the Honcho 3.x OpenAPI schema: MessageCreate.content caps
+# at 25,000 characters and MessageBatchCreate accepts at most 100 messages.
+SERVER_MAX_CONTENT = 25_000
+SERVER_MAX_BATCH = 100
+DEFAULT_MESSAGE_MAX_CHARS = SERVER_MAX_CONTENT
 DEFAULT_WORKSPACE_ID = "default"
 DEFAULT_USER_PEER = "user"
 DEFAULT_AI_PEER = "assistant"
@@ -543,9 +611,15 @@ def main() -> int:
     if resolved_cfg.message_max_chars < min_chunk:
         print(f"ERROR: message max chars must be >= {min_chunk}.", file=sys.stderr)
         return 1
+    if resolved_cfg.message_max_chars > SERVER_MAX_CONTENT:
+        print(f"ERROR: message max chars must be <= {SERVER_MAX_CONTENT}; the server rejects longer messages.", file=sys.stderr)
+        return 1
     if args.batch_size < 1:
         print("ERROR: --batch-size must be >= 1.", file=sys.stderr)
         return 1
+    if args.batch_size > SERVER_MAX_BATCH:
+        print(f"NOTE: --batch-size {args.batch_size} exceeds the server maximum of {SERVER_MAX_BATCH}; clamping.")
+        args.batch_size = SERVER_MAX_BATCH
     if args.batch_delay < 0:
         print("ERROR: --batch-delay must be >= 0.", file=sys.stderr)
         return 1
@@ -607,6 +681,7 @@ def main() -> int:
         print("      Pass --no-preserve-created-at for strict arrival-time replay.")
 
     print("\nPreparing Honcho client...")
+    print_version_banner(resolved_cfg.base_url, resolved_cfg.timeout)
     client = init_honcho(resolved_cfg, target_workspace)
     user_peer = client.peer(target_user_peer)
     ai_peer = client.peer(target_ai_peer)
@@ -668,10 +743,12 @@ def main() -> int:
                 try:
                     target_session = client.session(target_session_name)
                     if not args.force_reimport:
-                        existing = list(target_session.messages())
-                        if existing:
+                        # .total comes off the first page, so this costs one
+                        # request; iterating the SyncPage would walk every page.
+                        existing_count = target_session.messages(size=1).total
+                        if existing_count:
                             skipped += 1
-                            msg = f"  SKIP existing session with {len(existing)} messages already present"
+                            msg = f"  SKIP existing session with {existing_count} messages already present"
                             if args.verbose:
                                 msg += f": {target_session_name}"
                             print(msg)

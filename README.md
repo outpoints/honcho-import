@@ -17,8 +17,42 @@ Each importer is self-contained, has its own detailed README, and is **dry-run b
 ## Requirements
 
 - Python 3.10+
-- The `honcho-ai` Python package — `python -m pip install honcho-ai` (or `uv pip install honcho-ai`)
+- `honcho-ai` 2.4+ — `python -m pip install -r requirements.txt` (or `uv pip install -r requirements.txt`)
 - A reachable Honcho server (self-hosted or hosted)
+
+### Which SDK version?
+
+**Honcho server 3.x is driven by honcho-ai 2.x.** The server and the Python SDK
+are versioned independently, so the numbers never line up — there is no
+"honcho-ai 3.1.0". The 2.x line speaks the `/v3` API that Honcho 3.x serves;
+honcho-ai 1.x is an older, differently shaped client and will not work.
+
+Every importer prints both versions on startup and warns if they disagree:
+
+```text
+Server version: 3.1.0   SDK: honcho-ai 2.4.0 (speaks API v3)
+```
+
+This repo is verified end to end against **Honcho 3.1.0 with honcho-ai 2.4.0**.
+
+## Re-running an import
+
+The Claude Code and Cowork importers default to `--merge dedupe`: they read
+what the target session already holds and write only the messages missing from
+it. That makes an import **safe to re-run** and makes it pick up new
+conversations in sessions that were imported before — including folders where
+your live Honcho plugin is already writing.
+
+A dry run reads the workspace too, so its counts are the real delta:
+
+```text
+  [10/26] alex-my-app  chats=14 have=2593 deduped=69 -> 774 new chunks
+```
+
+`--merge skip` restores the old all-or-nothing behavior, `--merge gap` writes
+only history older than what is there, `--merge force` appends unconditionally,
+and `--offline` previews the transcripts without contacting the server at all.
+Details, including how dedupe matches, are in each importer's README.
 
 ## Quick start — Claude Code
 
@@ -50,7 +84,7 @@ python honcho_backfill.py \
   --execute
 ```
 
-Full options and behavior (content scope, merge/`--fill-gap`, exclusions) are in [`claude-code-backfill/README.md`](claude-code-backfill/README.md).
+Full options and behavior (content scope, `--merge` modes, exclusions) are in [`claude-code-backfill/README.md`](claude-code-backfill/README.md).
 
 ## Quick start — Claude Cowork
 
@@ -104,7 +138,8 @@ For an authenticated server, prefer `export HONCHO_API_KEY=...` over passing the
 
 ## Safety
 
-- **Dry-run by default** — every importer previews unless `--execute` is supplied.
+- **Dry-run by default** — every importer previews unless `--execute` is supplied. A dry run reads the target workspace (the SDK's get-or-create workspace call is the only write it makes) so the preview is the real delta; `--offline` skips even that.
+- **Re-runnable** — `--merge dedupe` (the default for the Claude Code and Cowork importers) will not write a message the session already has.
 - **No hardcoded identity** — peer names, workspace, URLs, and credentials come from config, env vars, or flags.
 - **Secrets** — conversation history can contain real credentials. Use `--redact-secrets` (and review the output) if your history may include API keys or tokens. Prefer `HONCHO_API_KEY` over passing keys as flags. Never commit `state.db`, `honcho.json`, `.env`, or logs (see `.gitignore`).
 
@@ -113,6 +148,7 @@ For an authenticated server, prefer `export HONCHO_API_KEY=...` over passing the
 ```text
 honcho-import/
 ├── README.md              # this overview
+├── requirements.txt       # honcho-ai floor (Honcho 3.x <- honcho-ai 2.x)
 ├── LICENSE                # applies repo-wide
 ├── claude-code-backfill/  # Claude Code importer + README
 ├── cowork-backfill/       # Claude Cowork importer + README

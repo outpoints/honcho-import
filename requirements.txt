@@ -1,0 +1,11 @@
+# Honcho server 3.x serves the /v3 API, and the Python SDK that speaks /v3 is
+# the honcho-ai 2.x line. The two are versioned independently, so the numbers
+# deliberately do not match — honcho-ai 1.x is an older, differently shaped
+# client (it wraps honcho_core) and will not work against a 3.x server.
+#
+#   python -m pip install -r requirements.txt
+#
+# Verified end to end against Honcho 3.1.0 with honcho-ai 2.4.0. The floor is
+# 2.4 because that is the release this repo is tested against; every importer
+# prints the server and SDK versions on startup and warns if they disagree.
+honcho-ai>=2.4,<3

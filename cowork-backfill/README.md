@@ -82,12 +82,16 @@ The importer **reports** the dispatch_child sessions it excludes (and the folder
 ## Requirements
 
 - Python 3.10+
-- The `honcho-ai` Python package
+- `honcho-ai` 2.4+ — the SDK line that speaks Honcho 3.x's `/v3` API
 - A reachable Honcho server and a configured `~/.honcho/config.json` (or equivalent CLI flags)
 
 ```bash
-python -m pip install honcho-ai
+python -m pip install -r ../requirements.txt
 ```
+
+The server and SDK version numbers do not line up: **Honcho server 3.x is
+driven by honcho-ai 2.x.** The importer prints both on startup and warns if the
+SDK is speaking a different API version than the server serves.
 
 ## Quick start
 
@@ -118,13 +122,34 @@ python honcho_backfill.py --execute
 
 ## Merging with live history (important)
 
-Because sessions are keyed **per folder** and (by default) land in the same `claude_code` workspace, an import can target a session your live Claude Code plugin already uses (e.g. `alex-my-app`). Three policies control what happens:
+Because sessions are keyed **per folder** and (by default) land in the same `claude_code` workspace, an import can target a session your live Claude Code plugin already uses (e.g. `alex-my-app`). Four policies control what happens:
 
 | Policy | Flag | Behavior |
 |---|---|---|
-| Skip (default) | — | Skip any session that already has messages. Safe. |
-| Fill the gap | `--fill-gap` | Import only Cowork messages **older** than the earliest existing message — backfills the history before the plugin started, no duplicates. |
-| Force append | `--force-reimport` | Append regardless (may duplicate). Use deliberately. |
+| Dedupe (default) | `--merge dedupe` | Read what the session already holds and write only the messages missing from it. Safe to re-run; picks up new Cowork chats in a folder that was imported before. |
+| Skip | `--merge skip` | Leave any session that already has messages completely alone (the old default). |
+| Fill the gap | `--merge gap` | Import only messages **older** than the earliest existing message — backfills the history from before the plugin started. |
+| Force append | `--merge force` | Append regardless. Duplicates. Use deliberately. |
+
+`--fill-gap` and `--force-reimport` still work as aliases for `--merge gap` and `--merge force`.
+
+Dedupe is what makes a Cowork folder that collides with Claude Code history
+importable at all: under the old skip-if-exists default, a Cowork chat on a
+folder your Claude Code plugin already writes to was dropped entirely.
+
+### How dedupe decides
+
+A message counts as already imported when the **same peer**, the **same text**
+(whitespace-normalized), and a creation time **within `--dedupe-window`
+seconds** (default 3600) all match an existing message. Matches are consumed
+one-for-one, so a line that genuinely repeats in a conversation is only
+suppressed as many times as it already exists.
+
+The clock check matters: a one-line summary like `[Tool] Ran: npm test
+(success)` recurs verbatim over months, and matching on text alone would let a
+message from May suppress an identical one from August. Widen the window with
+`--dedupe-window`, demand exact timestamps with `0`, or match on text alone
+with `-1`.
 
 To keep Cowork and Claude Code memory **separate** instead, import into a dedicated workspace: `--workspace cowork`.
 
@@ -155,12 +180,17 @@ Content scope (defaults are native; --no-* trims, --include-* goes beyond native
   --include-commands         Include slash-command turns
   --include-subagents        Include dispatch_child / sidechain transcripts
   --only-subagents           Import ONLY dispatch_child transcripts (add them after a base
-                             import; implies --include-subagents; pair with --force-reimport)
+                             import; implies --include-subagents; the default
+                             --merge dedupe appends them without duplicating)
   --redact-secrets           Redact obvious API tokens and labeled secrets
 
 Merge behavior
-  --force-reimport           Append even if the session already has messages
-  --fill-gap                 Import only messages older than existing data
+  --merge MODE               dedupe (default) | skip | gap | force
+  --dedupe-window SECONDS    Clock slack when matching an existing message
+                             (default: 3600; 0 = exact, -1 = text only)
+  --offline                  Dry-run without reading Honcho (no delta)
+  --force-reimport           Alias for --merge force
+  --fill-gap                 Alias for --merge gap
 
 Run control
   --execute                  Actually write to Honcho (otherwise dry-run)

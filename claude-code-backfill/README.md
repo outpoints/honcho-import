@@ -57,12 +57,16 @@ The importer **reports** what it skips (orphaned subagent-only projects, exclude
 ## Requirements
 
 - Python 3.10+
-- The `honcho-ai` Python package
+- `honcho-ai` 2.4+ — the SDK line that speaks Honcho 3.x's `/v3` API
 - A reachable Honcho server and a configured `~/.honcho/config.json` (or equivalent CLI flags)
 
 ```bash
-python -m pip install honcho-ai
+python -m pip install -r ../requirements.txt
 ```
+
+The server and SDK version numbers do not line up: **Honcho server 3.x is
+driven by honcho-ai 2.x.** The importer prints both on startup and warns if the
+SDK is speaking a different API version than the server serves.
 
 ## Quick start
 
@@ -97,11 +101,32 @@ Because sessions are keyed **per directory**, an import lands in the *same* Honc
 
 | Policy | Flag | Behavior |
 |---|---|---|
-| Skip (default) | — | Skip any session that already has messages. Safe. |
-| Fill the gap | `--fill-gap` | Import only transcript messages **older** than the earliest existing message — backfills the history before the plugin started, no duplicates. |
-| Force append | `--force-reimport` | Append regardless (may duplicate). Use deliberately. |
+| Dedupe (default) | `--merge dedupe` | Read what the session already holds and write only the messages missing from it. Safe to re-run; picks up new conversations in a session that was imported before. |
+| Skip | `--merge skip` | Leave any session that already has messages completely alone (the old default). |
+| Fill the gap | `--merge gap` | Import only messages **older** than the earliest existing message — backfills the history from before the plugin started. |
+| Force append | `--merge force` | Append regardless. Duplicates. Use deliberately. |
 
-Recommended: import a directory's history **before** you start using the plugin there, or use `--fill-gap`.
+`--fill-gap` and `--force-reimport` still work as aliases for `--merge gap` and `--merge force`.
+
+### How dedupe decides
+
+A message counts as already imported when the **same peer**, the **same text**
+(whitespace-normalized), and a creation time **within `--dedupe-window`
+seconds** (default 3600) all match an existing message. Matches are consumed
+one-for-one, so a line that genuinely repeats in a conversation is only
+suppressed as many times as it already exists.
+
+The clock check matters: a one-line summary like `[Tool] Ran: npm test
+(success)` recurs verbatim over months, and matching on text alone would let a
+message from May suppress an identical one from August. Widen the window with
+`--dedupe-window`, demand exact timestamps with `0`, or match on text alone
+with `-1`.
+
+Dedupe is best-effort on content the live plugin also wrote: the plugin's
+`[Session ended]` markers and `[Git External]` observations have no transcript
+equivalent (this importer never produces them), and a turn the plugin sliced at
+a different length reads as new text. Expect a small number of near-duplicate
+assistant turns when merging into a session with heavy live history.
 
 ## CLI reference
 
@@ -134,8 +159,12 @@ Content scope (defaults are native; --no-* trims, --include-* goes beyond native
   --redact-secrets           Redact obvious API tokens before import
 
 Merge behavior
-  --force-reimport           Append even if the session already has messages
-  --fill-gap                 Import only messages older than existing data
+  --merge MODE               dedupe (default) | skip | gap | force
+  --dedupe-window SECONDS    Clock slack when matching an existing message
+                             (default: 3600; 0 = exact, -1 = text only)
+  --offline                  Dry-run without reading Honcho (no delta)
+  --force-reimport           Alias for --merge force
+  --fill-gap                 Alias for --merge gap
 
 Run control
   --execute                  Actually write to Honcho (otherwise dry-run)
